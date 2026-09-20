@@ -1,61 +1,27 @@
-/* ══════════════════════════════════════════════════════════════
-   smora photo booth
-   ──────────────────────────────────────────────────────────────
-   SETTINGS you may want to change are all in CONFIG below.
-   The Discord webhook is NOT here on purpose — it lives in a
-   Vercel environment variable so nobody can read it from the page.
-   See README.md.
-   ══════════════════════════════════════════════════════════════ */
-
 const CONFIG = {
   name: "RyzeBooth",
   discordEndpoint: "/api/discord",  // Vercel function; leave as is
   photosEndpoint:  "/api/photos",   // photo database (admin gallery)  — api/photos.mjs
   configEndpoint:  "/api/config",   // booth-wide settings (removed paper colours) — api/config.mjs
-  discordInviteUrl: "",             // e.g. "https://discord.gg/yourcode" — shown as an icon in the top bar
+  communityEndpoint: "/api/community",       // strips + colours shared by everyone — api/community.mjs
+  publicConfigEndpoint: "/api/public-config", // links / peer server, read from env — api/public-config.mjs
+  discordInviteUrl: "",             // filled in from env DISCORD_INVITE_URL
+  githubUrl: "",                    // filled in from env GITHUB_URL
   defaultCaption: "",
 
-  /* Duo Booth is developer-only: tap the logo (or the locked Duo card) 5×,
-     sign in, and it unlocks. Should someone who was sent an invite link /
-     QR code by a developer be able to JOIN without signing in? true = yes.
-     Hosting always needs developer mode either way. */
-  duoLinkJoinOpen: true,
+
   maxPaperPhotos: 6,                // photo papers kept on a device
   maxShots: 8,
   duoPeerPrefix: "ryzebooth-",      // namespaces our codes on the shared PeerJS broker
 
-  /* ── WebRTC servers ───────────────────────────────────────
-     STUN only works when at least one side sits behind a simple
-     NAT. Most mobile carriers — and a lot of home ISPs — use
-     carrier-grade or symmetric NAT, which STUN cannot punch
-     through. That is the real reason the far-away partner used
-     to get a black screen: the data channel connected, the video
-     never found a path. A TURN server relays the video when no
-     direct path exists.
 
-     Real credentials now come from /api/ice (see api/ice.js and
-     SECURITY_AND_RELIABILITY.md) so no relay password is ever in
-     this file. The list below is only the LAST-RESORT fallback,
-     used if that endpoint cannot be reached. The openrelay entries
-     are a free public service: rate limited, no uptime promise.
-     ───────────────────────────────────────────────────────── */
   duoIceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun.cloudflare.com:3478" },
-    { urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject", credential: "openrelayproject" },
-    { urls: "turn:openrelay.metered.ca:443",
-      username: "openrelayproject", credential: "openrelayproject" },
-    { urls: "turns:openrelay.metered.ca:443?transport=tcp",
-      username: "openrelayproject", credential: "openrelayproject" }
+    { urls: "stun:stun.cloudflare.com:3478" }
   ],
 
-  /* Optional: your own signalling server (see peer-server/). The free
-     public PeerJS broker is a single shared service; if it hiccups,
-     nobody can start a call. Leave null to keep using it. Example:
-       { host: "ryze-peer.onrender.com", port: 443, path: "/ryzebooth",
-         secure: true, key: "peerjs" }                                 */
+
   peerServer: null,
 
   codeLength: 5,               // 32^5 ≈ 33.5 million codes. Short enough to read/type
@@ -116,12 +82,7 @@ const LOOKS = {
   sketch: {label:"Sketch",  css:"grayscale(1) contrast(1.9) brightness(1.15)"}
 };
 
-/* ─── paper ───────────────────────────────────────────────────
-   A paper is either a hex colour ("#FFF4E4") or a blend written
-   as "grad:#AAA,#BBB,160" — two colours and a CSS angle. Both the
-   swatches and the canvas read the same string, so anything the
-   user mixes shows up identically in the export.
-   ───────────────────────────────────────────────────────────── */
+
 const PAPERS = [
   "#FFFFFF","#FFF4E4","#FDEBD8","#FFE1EC","#F2A0BC","#E23E57",
   "#FFC24B","#FFF6A8","#C7F0D8","#7BD9A8","#BFE4FF","#7FB3FF",
@@ -139,7 +100,6 @@ const PAPERS = [
 
 function paperStops(p){
   const s = String(p || "#FFFFFF");
-  /* "img:<id>" — the visitor's own photo (kept on their device, see loadPapers) */
   if(s.startsWith("img:")) return { a: "#E9E4E1", b: "#E9E4E1", ang: 0, grad: false, img: s.slice(4) };
   if(s.startsWith("grad:")){
     const [a, b, ang] = s.slice(5).split(",");
@@ -152,8 +112,6 @@ function paperCss(p){
   return s.grad ? `linear-gradient(${s.ang}deg, ${s.a}, ${s.b})` : s.a;
 }
 
-/* Photo papers: decoded once, and we remember how bright each one is so the
-   caption / date pick a readable ink colour. */
 const paperImgCache = {};
 function paperImage(id){
   const held = S.paperImgs[id];
@@ -232,6 +190,7 @@ const S = {
   shots: [], stickers: [], sel: null, cat: "😀",
   busy: false, gallery: [], custom: {}, papers: [],
   paperImgs: {}, veil: 0, hiddenPapers: [],
+  community: {}, communityPapers: [], communityDb: null,   // shared with every visitor (see loadCommunity)
   dev: false, adminPass: "",          // adminPass lives in memory only, never stored
   duo: emptyDuo(), theme: "dark",
   duoView: "choice", chat: [], unread: 0, chatCollapsed: false
@@ -252,7 +211,7 @@ const LOCAL_VIDEOS = ["#cam", "#cam2", "#duoModalCam", "#duoSelfCam"];
 const $  = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const wait = ms => new Promise(r => setTimeout(r, ms));
-const FRAMES = () => ({ ...BUILTIN, ...S.custom });
+const FRAMES = () => ({ ...BUILTIN, ...S.community, ...S.custom });
 const F = () => FRAMES()[S.frame] || BUILTIN.strip4;
 const shotsOf = f => f.cols * f.rows;
 
@@ -302,30 +261,25 @@ function go(n){
 $$("[data-go]").forEach(b => b.onclick = () => go(+b.dataset.go));
 $("#toStep4").onclick = () => go(4);
 $("#soloCard").onclick = () => { teardownDuo(); releaseCam(); markCardSelected("solo"); go(2); };
-/* ─── Duo Booth is developer-only ─────────────────────────────
-   Visitors who tap the Duo card are told so. Five quick taps on the
-   logo (or on the locked card) open the admin sign-in; signing in
-   switches developer mode on and unlocks Duo for this tab. This is a
-   front-of-house gate for a feature still in development, not a
-   security boundary — the passcode itself is checked on the server.
-   Only developers can enter Duo Booth with no code and no partner
-   (duoSolo below). Everyone else needs a partner's code or link.        */
+/* ─── Duo Booth is open to everyone ───────────────────────────
+   Anyone can tap the Duo card, start a room or join one. Developer
+   mode (five quick taps on the logo, then the passcode) now only adds
+   the no-partner test mode and the admin tools — see duoSolo below.  */
 const DEV_KEY = "ryze_dev_v1";
-const LOCK_SVG  = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
 const ARROW_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h13M13 6l6 6-6 6"/></svg>';
-const DUO_LOCKED_MSG = "Duo Booth is only available in developer mode.";
+const DEV_ONLY_MSG = "Solo test mode is only available in developer mode.";
 
 function applyDuoGate(){
   const card = $("#duoCard");
-  card.classList.toggle("locked", !S.dev);
-  card.setAttribute("aria-disabled", S.dev ? "false" : "true");
-  $("#duoRibbon").hidden = S.dev;
-  $("#duoFootLabel").textContent = S.dev ? "Host or join" : "Locked";
-  $("#duoGo").innerHTML = S.dev ? ARROW_SVG : LOCK_SVG;
+  card.classList.remove("locked");
+  card.setAttribute("aria-disabled", "false");
+  $("#duoRibbon").hidden = true;
+  $("#duoFootLabel").textContent = "Host or join";
+  $("#duoGo").innerHTML = ARROW_SVG;
   $("#devPill").hidden = !S.dev;
-  /* only developers can start a room; joining is a separate choice (CONFIG.duoLinkJoinOpen) */
-  $("#duoHostBtn").hidden = !S.dev;
-  $("#duoHostHint").hidden = !S.dev;
+  /* hosting and joining are for everyone */
+  $("#duoHostBtn").hidden = false;
+  $("#duoHostHint").hidden = false;
   /* only developers can walk in with no code and no partner */
   $("#duoSoloBtn").hidden = !S.dev;
   $("#duoSoloHint").hidden = !S.dev;
@@ -342,14 +296,7 @@ $("#devPill").onclick = () => {
   setDev(false); markCardSelected("solo"); toast("Developer mode is off");
 };
 
-let duoTaps = 0, duoTapT;
-$("#duoCard").onclick = () => {
-  if(S.dev){ openDuoModal(); return; }
-  toast(DUO_LOCKED_MSG);
-  duoTaps++; clearTimeout(duoTapT);
-  duoTapT = setTimeout(() => duoTaps = 0, 900);
-  if(duoTaps >= 5){ duoTaps = 0; openAdmin(); }
-};
+$("#duoCard").onclick = () => openDuoModal();
 
 function markCardSelected(mode){
   $("#soloCard").classList.toggle("sel", mode === "solo");
@@ -430,18 +377,44 @@ $("#soundBtn").onclick = e => {
   if(S.sound) beep(900, .07);
 };
 
-/* Discord icon in the top bar — a plain invite link, nothing more.
-   Left blank until CONFIG.discordInviteUrl is set, so it can't 404. */
-$("#discordLink").onclick = e => {
-  if(!CONFIG.discordInviteUrl){
-    e.preventDefault();
-    toast("Add your server's invite link to CONFIG.discordInviteUrl in app.js", "bad");
-    return;
-  }
-  $("#discordLink").target = "_blank";
-  $("#discordLink").rel = "noopener";
-  $("#discordLink").href = CONFIG.discordInviteUrl;
-};
+/* Discord and GitHub icons in the top bar. Their URLs come from env
+   (DISCORD_INVITE_URL / GITHUB_URL, via /api/public-config). Until a
+   URL is set the icon is hidden, so it can never open a broken link. */
+function applyPublicLinks(){
+  const set = (sel, url) => {
+    const a = $(sel);
+    if(!a) return;
+    a.hidden = !url;
+    if(url){ a.href = url; a.target = "_blank"; a.rel = "noopener"; }
+  };
+  set("#discordLink", CONFIG.discordInviteUrl);
+  set("#githubLink", CONFIG.githubUrl);
+}
+
+/* Reads the public, non-secret settings from env. Never rejects; on any
+   failure the booth simply keeps its built-in defaults. */
+async function loadPublicConfig(){
+  try{
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 2500);
+    const res = await fetch(CONFIG.publicConfigEndpoint, { cache: "no-store", signal: ctl.signal });
+    clearTimeout(t);
+    if(!res.ok) return;
+    const j = await res.json();
+    if(j && typeof j.name === "string" && j.name) CONFIG.name = j.name;
+    if(j && typeof j.discordInviteUrl === "string") CONFIG.discordInviteUrl = j.discordInviteUrl;
+    if(j && typeof j.githubUrl === "string") CONFIG.githubUrl = j.githubUrl;
+    const ps = j && j.peerServer;
+    if(ps && typeof ps.host === "string" && ps.host){
+      CONFIG.peerServer = {
+        host: ps.host, port: Number(ps.port) || 443,
+        path: typeof ps.path === "string" ? ps.path : "/ryzebooth",
+        secure: ps.secure !== false, key: typeof ps.key === "string" ? ps.key : "peerjs"
+      };
+    }
+  }catch(e){}
+  $("#brandName").textContent = CONFIG.name;
+  applyPublicLinks();
+}
 
 /* ─── light / dark theme ──────────────────────────────────── */
 const THEME_KEY = "smora_theme_v1";
@@ -472,7 +445,7 @@ function buildLayouts(host, showDelete = false, filterFn = null){
   host.innerHTML = entries.map(([k, f]) => {
     const cells = Array(Math.min(shotsOf(f), 12)).fill('<i></i>').join("");
     return `<button class="lay ${k === S.frame && !showDelete ? "on" : ""}" data-f="${k}">
-      ${showDelete && S.custom[k] ? `<span class="del" data-del="${k}" title="Delete">✕</span>` : ""}
+      ${showDelete && canDeleteFrame(k) ? `<span class="del" data-del="${esc(k)}" title="Delete">✕</span>` : ""}
       <span class="mini" style="grid-template-columns:repeat(${f.cols},1fr)">${cells}</span>
       <b>${esc(f.label)}</b><small>${shotsOf(f)} photo${shotsOf(f) > 1 ? "s" : ""}</small>
     </button>`;
@@ -487,10 +460,16 @@ function buildLayouts(host, showDelete = false, filterFn = null){
     prepShots();
     if(S.duo.active && S.duo.role === "host") sendDuo({ type: "config", frame: S.frame, look: S.look, timer: S.timer });
   });
-  host.querySelectorAll("[data-del]").forEach(b => b.onclick = () => {
-    if(!confirm("Delete this strip layout?")) return;
-    delete S.custom[b.dataset.del];
-    saveCustom(); buildLayouts($("#adminList"), true); buildLayouts($("#layouts"), false, layoutFilter());
+  host.querySelectorAll("[data-del]").forEach(b => b.onclick = async () => {
+    const key = b.dataset.del;
+    if(!confirm(isCommunityKey(key) ? "Delete this strip for everyone?" : "Delete this strip layout?")) return;
+    if(isCommunityKey(key)){
+      if(!(await deleteCommunityStrip(key))) return;
+    }else{
+      delete S.custom[key]; saveCustom();
+    }
+    if(!FRAMES()[S.frame]) S.frame = "strip4";
+    buildLayouts($("#adminList"), true); buildLayouts($("#layouts"), false, layoutFilter());
   });
 }
 
@@ -585,14 +564,24 @@ function ensurePaperVisible(){
   if(!S.bg.startsWith("img:") && hiddenSet().has(S.bg)) S.bg = fallbackPaper();
 }
 
-function addPaper(p){
-  if(S.papers.includes(p) || PAPERS.includes(p)){ S.bg = p; buildSwatches(); drawPreview(); return; }
+async function addPaper(p){
+  if(S.papers.includes(p) || S.communityPapers.includes(p) || PAPERS.includes(p)){ S.bg = p; buildSwatches(); drawPreview(); return; }
+  /* colours and blends are shared: saved on the server so every visitor gets them */
+  const shared = await sharePaper(p);
+  if(shared){
+    if(!S.communityPapers.includes(shared)) S.communityPapers.unshift(shared);
+    S.bg = shared;
+    buildSwatches(); drawPreview();
+    toast("Colour added for everyone", "good");
+    return;
+  }
+  /* no database / offline: keep it on this device like before */
   S.papers.unshift(p);
   S.papers = S.papers.slice(0, 24);
   savePapers();
   S.bg = p;
   buildSwatches(); drawPreview();
-  toast("Paper added", "good");
+  toast("Paper added — saved on this device only", "good");
 }
 
 /* ── photo as paper ───────────────────────────────────────── */
@@ -648,15 +637,19 @@ async function addPaperPhoto(file){
 
 function buildSwatches(){
   ensurePaperVisible();
+  const shared = S.communityPapers.filter(p => !PAPERS.includes(p));
+  const local  = S.papers.filter(p => !shared.includes(p));
   const items = [
-    ...visiblePapers().map(p => ({ p, mine: false })),
-    ...S.papers.map(p => ({ p, mine: true }))
+    ...visiblePapers().map(p => ({ p })),
+    ...shared.map(p => ({ p, shared: true })),
+    ...local.map(p => ({ p, mine: true }))
   ];
-  $("#swatches").innerHTML = items.map(({ p, mine }) => `
+  $("#swatches").innerHTML = items.map(({ p, mine, shared }) => `
     <span class="swwrap">
       <button class="sw ${isImgPaper(p) ? "photo" : ""} ${S.bg === p ? "on" : ""}" data-c="${esc(p)}"
               style="background:${paperCss(p)}" aria-label="${isImgPaper(p) ? "Photo paper" : "Paper " + esc(p)}"></button>
       ${mine ? `<i class="swdel" data-rm="${esc(p)}" title="Remove">✕</i>` : ""}
+      ${shared && S.adminPass ? `<i class="swdel" data-rmc="${esc(p)}" title="Remove for everyone (admin)">✕</i>` : ""}
     </span>`).join("");
 
   /* photo swatches show a tiny thumbnail (set here, not in the attribute) */
@@ -678,6 +671,19 @@ function buildSwatches(){
     buildSwatches(); drawPreview();
   });
 
+  $("#swatches").querySelectorAll("[data-rmc]").forEach(b => b.onclick = async e => {
+    e.stopPropagation();
+    const gone = b.dataset.rmc;
+    if(!confirm("Remove this colour for every visitor?")) return;
+    const res = await adminFetch(`${CONFIG.communityEndpoint}?type=paper&value=${encodeURIComponent(gone)}`, { method: "DELETE" });
+    if(!res) return;
+    if(!res.ok){ toast("Couldn't remove it — try again", "bad"); return; }
+    S.communityPapers = S.communityPapers.filter(x => x !== gone);
+    if(S.bg === gone) S.bg = fallbackPaper();
+    buildSwatches(); drawPreview();
+    toast("Colour removed for everyone", "good");
+  });
+
   $("#veilWrap").hidden = !isImgPaper(S.bg);
   $("#paperVeil").value = Math.round(S.veil * 100);
 }
@@ -686,7 +692,7 @@ function wirePaperTools(){
   const a = $("#paperA"), b = $("#paperB"), ang = $("#paperAngle");
   if(!a) return;
   $("#paperAddSolid").onclick = () => addPaper(a.value.toUpperCase());
-  $("#paperAddBlend").onclick = () => addPaper(`grad:${a.value.toUpperCase()},${b.value.toUpperCase()},${ang.value || 160}`);
+  $("#paperAddBlend").onclick = () => addPaper(`grad:${a.value.toUpperCase()},${b.value.toUpperCase()},${Math.round(clamp(+ang.value || 160, 0, 360))}`);
   const live = () => {
     $("#paperPrev").style.background =
       `linear-gradient(${ang.value || 160}deg, ${a.value}, ${b.value})`;
@@ -1268,7 +1274,7 @@ $("#duoBackBtn").onclick   = () => { teardownDuo(); showDuoView("choice"); };
    Your one camera fills both halves of every shot, so you can test the
    layouts, looks and the finished strip without a second device. */
 async function duoSolo(){
-  if(!S.dev){ toast(DUO_LOCKED_MSG); return; }
+  if(!S.dev){ toast(DEV_ONLY_MSG); return; }
   teardownDuo();
   const seq = ++duoSeq;
   S.duo.active = true; S.duo.role = "host"; S.duo.solo = true;
@@ -1360,7 +1366,6 @@ function checkPath(servers, seq){
 }
 
 async function duoHost(){
-  if(!S.dev){ toast(DUO_LOCKED_MSG); return; }
   teardownDuo();
   const seq = ++duoSeq;
   showDuoView("host");
@@ -1545,7 +1550,17 @@ function handleDuoData(msg){
     if(!has(LOOKS, msg.look)) return;
     if(![0, 3, 5, 10].includes(msg.timer)) return;
     if(typeof msg.frame !== "string") return;
-    /* the host may use a custom strip we don't have — fall back like before */
+    /* the host may use a shared strip we haven't loaded yet — fetch the library and retry;
+       a strip that only lives on the host's device still falls back like before */
+    if(!has(FRAMES(), msg.frame) && /^u_[a-z0-9-]{6,40}$/.test(msg.frame)){
+      const want = msg.frame;
+      loadCommunity().then(() => {
+        if(S.duo.role === "guest" && FRAMES()[want]){
+          S.frame = want; S.shots = []; S.stickers = []; S.sel = null;
+          buildLayouts($("#layouts"), false, layoutFilter()); prepShots();
+        }
+      });
+    }
     S.frame = has(FRAMES(), msg.frame) ? msg.frame : "strip4";
     S.look = msg.look; S.timer = msg.timer;
     buildChips($("#looks2"), LOOKS, "look"); buildChips($("#looks3"), LOOKS, "look");
@@ -1684,8 +1699,6 @@ function teardownRemoteVideo(){
   const dm = $("#duoRemoteMsg"); if(dm) dm.hidden = false;
 }
 
-/* Re-dials until video actually arrives. This is what turns a
-   permanent black screen into a few seconds of "Connecting…". */
 function startMediaWatchdog(){
   clearInterval(S.duo.watchT);
   S.duo.watchT = setInterval(() => {
@@ -1704,9 +1717,7 @@ function videoLive(){
   return !!(r && r.getVideoTracks().some(t => t.readyState === "live"));
 }
 
-/* Phones roam between Wi-Fi and mobile data, lock their screens and
-   switch tabs. Any of those can silently kill a call — so when the
-   device comes back, check and heal instead of waiting for the timer. */
+
 function healIfNeeded(){
   if(!S.duo.peer) return;
   try{ if(S.duo.peer.disconnected) S.duo.peer.reconnect(); }catch(e){}
@@ -1869,11 +1880,7 @@ async function postToGallery(canvas){
   }catch(e){ return false; }
 }
 
-/* iOS Safari ignores the `download` attribute (it just opens the image in a
-   new tab instead of saving it), so there the share sheet's "Save Image" is
-   the only reliable way to land the strip in Photos. Everywhere else — Android,
-   desktop — a plain download link saves straight to the Downloads folder with
-   no extra tap, so that's what we do first. */
+
 function isIOSDevice(){
   return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
          (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
@@ -1898,7 +1905,7 @@ async function saveToDevice(blob){
       if(err && err.name === "AbortError") return false;
     }
   }
-  downloadBlob(blob);   // last-resort fallback for the rare iOS browser with no Web Share
+  downloadBlob(blob);   
   return true;
 }
 
@@ -1914,7 +1921,6 @@ $("#saveBtn").onclick = async () => {
     beep(880, .1); setTimeout(() => beep(1180, .13), 110);
   }
 
-  /* Only after they really saved (cancelling the share sheet uploads nothing). */
   const [ok] = saved ? await Promise.all([postToDiscord(blob), postToGallery(c)]) : [false];
   toast(
     saved ? (ok ? "Saved to your device and to Discord" : "Saved to your device") : "Not saved — tap Save again",
@@ -1939,9 +1945,152 @@ $("#againBtn").onclick = () => {
   go(2);
 };
 
-/* ══════════════════════════════════════════════════════════
-   ADMIN — add strip layouts
-   ══════════════════════════════════════════════════════════ */
+const OWNER_KEY = "ryze_owner_v1";
+const MINE_KEY  = "ryze_my_strips_v1";
+const SHARE_OVERLAY_MAX = 700000;                 
+const isCommunityKey = k => typeof k === "string" && k.startsWith("u_");
+const validPaper = p => typeof p === "string" &&
+  (/^#[0-9A-F]{6}$/i.test(p) || /^grad:#[0-9A-F]{6},#[0-9A-F]{6},\d{1,3}$/i.test(p));
+
+function randomHex(n){
+  const b = new Uint8Array(n); crypto.getRandomValues(b);
+  return [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+}
+let tmpOwner = "";
+function ownerToken(){
+  try{
+    const t = localStorage.getItem(OWNER_KEY);
+    if(t && /^[A-Za-z0-9_-]{16,80}$/.test(t)) return t;
+    const n = randomHex(24);
+    localStorage.setItem(OWNER_KEY, n);
+    return n;
+  }catch(e){ return tmpOwner || (tmpOwner = randomHex(24)); }     
+}
+const mineStrips = () => {
+  try{ const v = JSON.parse(localStorage.getItem(MINE_KEY) || "[]"); return Array.isArray(v) ? v : []; }
+  catch(e){ return []; }
+};
+function rememberMine(id){
+  const v = mineStrips().filter(x => x !== id); v.unshift(id);
+  try{ localStorage.setItem(MINE_KEY, JSON.stringify(v.slice(0, 100))); }catch(e){}
+}
+function forgetMine(id){
+  try{ localStorage.setItem(MINE_KEY, JSON.stringify(mineStrips().filter(x => x !== id))); }catch(e){}
+}
+const canDeleteFrame = k => !!S.custom[k] || (isCommunityKey(k) && (!!S.adminPass || mineStrips().includes(k.slice(2))));
+
+function cleanCommunityStrip(r){
+  if(!r || typeof r.id !== "string" || !/^[a-z0-9-]{6,40}$/.test(r.id)) return null;
+  const f = {
+    label: String(r.label || "Custom strip").slice(0, 26),
+    cols: clamp(+r.cols, 1, 6),   rows: clamp(+r.rows, 1, 8),
+    cw:   clamp(+r.cw, 120, 2000), ch:  clamp(+r.ch, 120, 2000),
+    pad:  clamp(+r.pad, 0, 200),   gap: clamp(+r.gap, 0, 200),
+    foot: clamp(+r.foot, 0, 400),  rad: clamp(+r.rad, 0, 120),
+    overlay: null
+  };
+  if(typeof r.overlay === "string" && r.overlay.startsWith(CONFIG.communityEndpoint + "?overlay=")) f.overlay = r.overlay;
+  return f;
+}
+
+function refreshCommunityUI(){
+  if(!FRAMES()[S.frame]) S.frame = "strip4";
+  buildLayouts($("#layouts"), false, layoutFilter());
+  if($("#adminModal").classList.contains("on") && !$("#adminBody").hidden) buildLayouts($("#adminList"), true);
+  buildSwatches();
+  if(S.step === 4) drawPreview();
+}
+
+async function loadCommunity(){
+  try{
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 4000);
+    const res = await fetch(CONFIG.communityEndpoint, { cache: "no-store", signal: ctl.signal });
+    clearTimeout(t);
+    if(!res.ok) return false;
+    const j = await res.json();
+    S.communityDb = !!j.db;
+    if(!j.db) return false;
+    const strips = {};
+    for(const r of Array.isArray(j.strips) ? j.strips : []){
+      const f = cleanCommunityStrip(r);
+      if(f) strips["u_" + r.id] = f;
+    }
+    S.community = strips;
+    S.communityPapers = (Array.isArray(j.papers) ? j.papers : []).filter(validPaper).slice(0, 300);
+    refreshCommunityUI();
+    return true;
+  }catch(e){ return false; }
+}
+
+async function sharePaper(p){
+  try{
+    const res = await fetch(CONFIG.communityEndpoint, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "paper", paper: p })
+    });
+    if(!res.ok) return null;
+    const j = await res.json();
+    return validPaper(j && j.paper) ? j.paper : null;
+  }catch(e){ return null; }
+}
+
+function fitOverlay(url){
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      for(const max of [1100, 900, 700, 550, 420]){
+        const sc = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+        const c = document.createElement("canvas");
+        c.width = Math.max(1, Math.round(img.naturalWidth * sc));
+        c.height = Math.max(1, Math.round(img.naturalHeight * sc));
+        c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+        const out = c.toDataURL("image/png");
+        if(out.length <= SHARE_OVERLAY_MAX){ resolve(out); return; }
+      }
+      resolve(null);
+    };
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
+}
+
+async function shareStrip(f){
+  let overlay = f.overlay || "";
+  if(overlay && overlay.length > SHARE_OVERLAY_MAX){
+    overlay = await fitOverlay(overlay);
+    if(!overlay) return { tooBig: true };
+  }
+  try{
+    const res = await fetch(CONFIG.communityEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-owner": ownerToken() },
+      body: JSON.stringify({ ...f, type: "strip", overlay })
+    });
+    if(!res.ok) return null;
+    const j = await res.json();
+    const frame = cleanCommunityStrip(j && j.strip);
+    return frame ? { id: j.strip.id, frame } : null;
+  }catch(e){ return null; }
+}
+
+async function deleteCommunityStrip(key){
+  const id = key.slice(2);
+  try{
+    const headers = { "x-owner": ownerToken() };
+    if(S.adminPass) headers["x-admin-pass"] = encodeURIComponent(S.adminPass);
+    const res = await fetch(`${CONFIG.communityEndpoint}?type=strip&id=${encodeURIComponent(id)}`,
+      { method: "DELETE", headers, cache: "no-store" });
+    if(res.ok){
+      delete S.community[key]; forgetMine(id);
+      toast("Strip removed for everyone", "good");
+      return true;
+    }
+    toast(res.status === 403 ? "Only the person who made it, or the admin, can delete it" : "Couldn't delete — try again", "bad");
+  }catch(e){ toast("Couldn't reach the server — are you online?", "bad"); }
+  return false;
+}
+
+
 const KEY = "smora_strips_v1";
 function loadCustom(){
   try{ S.custom = JSON.parse(localStorage.getItem(KEY) || "{}"); }catch(e){ S.custom = {}; }
@@ -1957,9 +2106,7 @@ $("#brandBtn").onclick = () => {
   tapT = setTimeout(() => tapCount = 0, 900);
   if(tapCount >= 5){ tapCount = 0; openAdmin(); }
 };
-/* Visitors can still use "+ Design your own strip" (layouts live in their own browser).
-   The other tabs — paper colours and saved photos — need the passcode, and the server
-   checks it on every request; the tab bar simply stays hidden until you are signed in. */
+
 function showAdminBody(signedIn){
   $("#adminLock").hidden = true; $("#adminBody").hidden = false;
   $("#adminTabs").hidden = !signedIn;
@@ -1968,6 +2115,7 @@ function showAdminBody(signedIn){
 }
 function openAdmin(skipLock = false){
   $("#adminModal").classList.add("on");
+  loadCommunity();                     
   if(skipLock || S.adminPass){ showAdminBody(!!S.adminPass); }
   else{ $("#adminLock").hidden = false; $("#adminBody").hidden = true; $("#adminPass").value = ""; }
 }
@@ -1991,10 +2139,9 @@ $("#adminGo").onclick = async () => {
   }catch(e){ toast("Couldn't check the passcode — are you online?", "bad"); return; }
   finally{ btn.disabled = false; }
   $("#adminPass").value = "";
-  S.adminPass = pass;                 // memory only — gone on reload
+  S.adminPass = pass;                
   setDev(true);
-  /* Signing in only switches developer mode on. It no longer drags you into
-     Duo Booth — tap the Duo card when you want it. */
+
   $("#adminModal").classList.remove("on");
   toast("Developer mode on", "good");
 };
@@ -2013,7 +2160,6 @@ function adminTab(name){
 }
 $$("#adminTabs [data-tab]").forEach(b => b.onclick = () => adminTab(b.dataset.tab));
 
-/* fetch with the passcode attached; a 401 means it changed or was mistyped → sign out */
 async function adminFetch(url, opts = {}){
   try{
     const res = await fetch(url, {
@@ -2032,9 +2178,8 @@ async function adminFetch(url, opts = {}){
 }
 const errOf = async res => { try{ return (await res.clone().json()).error || ""; }catch(e){ return ""; } };
 
-/* ─── admin: paper colours ────────────────────────────────── */
 const CFG_CACHE_KEY = "smora_cfg_v1";
-let cfgDb = null;                       // true / false once /api/config has answered
+let cfgDb = null;                      
 let paperDraft = new Set();
 
 async function loadConfig(){
@@ -2053,7 +2198,6 @@ async function loadConfig(){
     }
   }catch(e){}
   const read = key => { try{ const v = JSON.parse(localStorage.getItem(key) || "null"); return Array.isArray(v) ? v : null; }catch(e){ return null; } };
-  /* server answer > last known server answer (we were offline) > this-device fallback */
   if(list === null) list = cfgDb === false ? read(HIDDEN_LOCAL_KEY) : (read(CFG_CACHE_KEY) || read(HIDDEN_LOCAL_KEY));
   applyHiddenPapers(list || []);
 }
@@ -2120,7 +2264,6 @@ $("#paperSave").onclick = async () => {
   }finally{ btn.disabled = false; }
 };
 
-/* ─── admin: saved photos ─────────────────────────────────── */
 const photoState = { items: [], next: 0, busy: false, open: null, seq: 0 };
 const isJpegUrl = u => typeof u === "string" && u.startsWith("data:image/jpeg;base64,");
 const when = at => new Date(at).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
@@ -2178,7 +2321,7 @@ async function openPhoto(it){
   photoState.open = it;
   $("#photoMeta").textContent = `${it.frame || "Strip"} · ${it.mode === "duo" ? "Duo" : "Solo"} · ${when(it.at)}`;
   const big = $("#photoBig");
-  big.src = it.thumb;                                     // instant, blurry — replaced below
+  big.src = it.thumb;                                     
   $("#photoDl").href = it.thumb;
   $("#photoModal").classList.add("on");
   const res = await adminFetch(`${CONFIG.photosEndpoint}?id=${encodeURIComponent(it.id)}`);
@@ -2260,16 +2403,29 @@ function downscale(file, max){
   });
 }
 
-$("#fSave").onclick = () => {
+$("#fSave").onclick = async () => {
+  const btn = $("#fSave");
   const f = readForm();
   if(shotsOf(f) > CONFIG.maxShots){ toast(`That is ${shotsOf(f)} photos — the limit is ${CONFIG.maxShots}`, "bad"); return; }
-  const key = "c_" + Date.now().toString(36);
-  S.custom[key] = f;
-  saveCustom();
+  btn.disabled = true;
+  try{
+    const shared = await shareStrip(f);
+    if(shared && shared.id){
+      S.community = { ["u_" + shared.id]: shared.frame, ...S.community };
+      rememberMine(shared.id);
+      toast(`"${f.label}" added for everyone`, "good");
+    }else{
+      const key = "c_" + Date.now().toString(36);
+      S.custom[key] = f;
+      saveCustom();
+      toast(shared && shared.tooBig
+        ? `"${f.label}" saved on this device only — the overlay is too detailed to share`
+        : `"${f.label}" added — saved on this device only`, "good");
+    }
+  }finally{ btn.disabled = false; }
   formOverlay = null; $("#fOver").value = ""; $("#fName").value = "";
   buildLayouts($("#adminList"), true); buildLayouts($("#layouts"), false, layoutFilter());
   drawFormPreview();
-  toast(`"${f.label}" added`, "good");
 };
 
 $("#fExport").onclick = () => {
@@ -2293,17 +2449,19 @@ $("#fImport").addEventListener("change", e => {
   r.readAsText(file);
 });
 
-/* ─── boot ────────────────────────────────────────────────── */
 (async function init(){
   $("#brandName").textContent = CONFIG.name;
+  applyPublicLinks();                    
+  const cfgReady = loadPublicConfig();   
   ICE.setFallback(CONFIG.duoIceServers);
-  ICE.prefetch();          // credentials are usually ready before anyone taps Duo Booth
+  ICE.prefetch();         
   loadTheme();
   loadCustom();
   loadPapers();
   try{ S.dev = sessionStorage.getItem(DEV_KEY) === "1"; }catch(e){ S.dev = false; }
   applyDuoGate();
-  loadConfig();            // removed paper colours — runs alongside the rest of boot, never blocks it
+  loadConfig();            
+  loadCommunity();         
 
   try{
     const res = await fetch("strips.json", { cache: "no-store" });
@@ -2318,17 +2476,15 @@ $("#fImport").addEventListener("change", e => {
   $("#caption").value = S.caption;
   go(1);
 
-  /* someone opened a shared link or scanned the QR */
+  await cfgReady;
   const params = new URLSearchParams(location.search);
   if(params.has("duo")){
     const code = codeFromText(params.get("duo"));
     history.replaceState(null, "", location.pathname);
-    if(code && (S.dev || CONFIG.duoLinkJoinOpen)){
+    if(code){
       markCardSelected("duo");
       openDuoModal(code);
       setTimeout(() => duoJoin(code), 400);
-    }else if(code){
-      toast(DUO_LOCKED_MSG);
     }
   }
 
